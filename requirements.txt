@@ -9,5 +9,4 @@ uvicorn
 joblib
 mlflow
 shap
-gradio
 evidently
