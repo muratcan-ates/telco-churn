@@ -1,61 +1,129 @@
-"""SHAP-based explainability utilities for single churn predictions."""
+"""SHAP-based explainability utilities for single churn predictions.
 
+The :class:`ChurnExplainer` loads the fitted pipeline, a background sample
+drawn at training time, and the transformed feature names, then builds a
+LinearExplainer backed by a :class:`shap.maskers.Independent` masker. Using a
+proper background distribution is what keeps SHAP values from collapsing to
+zero -- a single-row background would mask every contribution.
+"""
+
+from __future__ import annotations
+
+from functools import lru_cache
+
+import joblib
 import numpy as np
 import pandas as pd
 import shap
-from sklearn.pipeline import Pipeline
+
+from src.config import MODEL_PATH
+
+BACKGROUND_PATH = "models/background_data.pkl"
+FEATURE_NAMES_PATH = "models/feature_names.pkl"
+
+
+class ChurnExplainer:
+    """Wrap a fitted churn pipeline with a background-backed LinearExplainer."""
+
+    def __init__(
+        self,
+        model_path: str = MODEL_PATH,
+        background_path: str = BACKGROUND_PATH,
+        feature_names_path: str = FEATURE_NAMES_PATH,
+    ) -> None:
+        self.pipeline = joblib.load(model_path)
+        self.background: pd.DataFrame = joblib.load(background_path)
+        self.feature_names: list[str] = joblib.load(feature_names_path)
+
+        self.preprocessor = self.pipeline.named_steps["preprocessor"]
+        self.classifier = self.pipeline.named_steps["classifier"]
+
+        masker = shap.maskers.Independent(self.background, max_samples=100)
+        self.explainer = shap.LinearExplainer(self.classifier, masker)
+        self.expected_value = float(
+            np.ravel(self.explainer.expected_value)[0]
+        )
+
+    def predict_and_explain(
+        self,
+        row: dict | pd.DataFrame,
+        top_n: int = 5,
+    ) -> dict:
+        """Score a single customer and return the top SHAP drivers.
+
+        Returns a dict with ``prediction``, ``probability``, ``expected_value``,
+        and ``top_factors``. Factors with exactly zero impact are skipped.
+        """
+        frame = pd.DataFrame([row]) if isinstance(row, dict) else row
+
+        proba = float(self.pipeline.predict_proba(frame)[0, 1])
+        pred = int(proba >= 0.5)
+
+        x_trans = self.preprocessor.transform(frame)
+        if hasattr(x_trans, "toarray"):
+            x_trans = x_trans.toarray()
+        x_trans_df = pd.DataFrame(x_trans, columns=self.feature_names)
+
+        explanation = self.explainer(x_trans_df)
+        shap_vals = np.asarray(explanation.values).reshape(-1)
+        feature_values = np.asarray(x_trans_df.iloc[0])
+
+        order = np.argsort(np.abs(shap_vals))[::-1]
+
+        top_factors: list[dict] = []
+        for idx in order:
+            impact = float(shap_vals[idx])
+            if impact == 0.0:
+                continue
+            top_factors.append({
+                "feature": _clean_name(self.feature_names[idx]),
+                "value": float(feature_values[idx]),
+                "impact": impact,
+                "direction": (
+                    "increases_churn" if impact > 0 else "retains"
+                ),
+            })
+            if len(top_factors) >= top_n:
+                break
+
+        return {
+            "prediction": pred,
+            "probability": proba,
+            "expected_value": self.expected_value,
+            "top_factors": top_factors,
+        }
+
+
+def _clean_name(raw: str) -> str:
+    """Strip the ColumnTransformer ``num__`` / ``cat__`` prefixes."""
+    return raw.replace("num__", "").replace("cat__", "")
+
+
+@lru_cache(maxsize=1)
+def get_explainer() -> ChurnExplainer:
+    """Return a process-wide singleton ChurnExplainer."""
+    return ChurnExplainer()
 
 
 def get_top_factors(
-    pipeline: Pipeline,
+    pipeline,  # noqa: ARG001 - kept for backward-compat with the old signature
     X_single: pd.DataFrame,
     top_n: int = 5,
 ) -> list[dict]:
-    """Return the top ``top_n`` features driving a single customer's churn prediction.
+    """Return the top churn drivers in the legacy (absolute-impact) format.
 
-    Each factor is reported as a dict with three keys:
-        - ``feature``: the cleaned feature name (``num__``/``cat__`` prefix stripped).
-        - ``impact``:  the absolute SHAP value (magnitude of contribution).
-        - ``direction``: ``'increases_churn'`` if the SHAP value is positive,
-          ``'decreases_churn'`` otherwise.
+    Preserved so ``api.main`` keeps working while we migrate callers to
+    :class:`ChurnExplainer` directly.
     """
-    preprocessor = pipeline.named_steps['preprocessor']
-    classifier = pipeline.named_steps['classifier']
-
-    X_transformed = preprocessor.transform(X_single)
-    feature_names = _clean_feature_names(preprocessor.get_feature_names_out())
-
-    explainer = shap.LinearExplainer(classifier, X_transformed)
-    shap_values = explainer(X_transformed).values
-    values = _positive_class_values(shap_values)
-
-    abs_values = np.abs(values)
-    top_indices = np.argsort(abs_values)[::-1][:top_n]
-
+    result = get_explainer().predict_and_explain(X_single, top_n=top_n)
     return [
         {
-            'feature': feature_names[idx],
-            'impact': float(abs_values[idx]),
-            'direction': 'increases_churn' if values[idx] > 0 else 'decreases_churn',
+            "feature": factor["feature"],
+            "impact": abs(factor["impact"]),
+            "direction": (
+                "increases_churn" if factor["impact"] > 0
+                else "decreases_churn"
+            ),
         }
-        for idx in top_indices
+        for factor in result["top_factors"]
     ]
-
-
-def _clean_feature_names(raw_names) -> list[str]:
-    """Strip the ColumnTransformer ``num__`` / ``cat__`` prefixes from feature names."""
-    return [name.replace('num__', '').replace('cat__', '') for name in raw_names]
-
-
-def _positive_class_values(shap_values) -> np.ndarray:
-    """Return the 1-D SHAP values for the positive (churn) class of the first sample.
-
-    Handles both legacy SHAP output (list of per-class arrays) and the newer
-    3-D array layout ``(n_samples, n_features, n_classes)``.
-    """
-    if isinstance(shap_values, list):
-        return shap_values[1][0]
-    values = np.asarray(shap_values)
-    if values.ndim == 3:
-        return values[0, :, 1]
-    return values[0]

@@ -8,6 +8,9 @@ from __future__ import annotations
 
 import joblib
 import mlflow
+import numpy as np
+import pandas as pd
+import shap
 from sklearn.base import BaseEstimator
 from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
@@ -25,6 +28,9 @@ from src.pipeline import create_pipeline
 
 RANDOM_STATE = 42
 TEST_SIZE = 0.2
+BACKGROUND_SIZE = 100
+BACKGROUND_PATH = "models/background_data.pkl"
+FEATURE_NAMES_PATH = "models/feature_names.pkl"
 
 
 def build_candidate_models() -> dict[str, BaseEstimator]:
@@ -78,6 +84,44 @@ def save_artifacts(pipeline, feature_columns: list[str]) -> None:
     joblib.dump(feature_columns, COLUMNS_PATH)
 
 
+def save_shap_background(pipeline, X_train: pd.DataFrame) -> None:
+    """Persist a SHAP background sample and transformed feature names.
+
+    LinearExplainer needs a representative background distribution to produce
+    non-degenerate SHAP values; a single-row masker collapses every
+    contribution to zero. We sample ``BACKGROUND_SIZE`` rows from the
+    transformed training matrix and store them alongside the feature names.
+    """
+    preprocessor = pipeline.named_steps['preprocessor']
+    classifier = pipeline.named_steps['classifier']
+
+    X_train_transformed = preprocessor.transform(X_train)
+    if hasattr(X_train_transformed, 'toarray'):
+        X_train_transformed = X_train_transformed.toarray()
+
+    feature_names = list(preprocessor.get_feature_names_out())
+    X_train_transformed_df = pd.DataFrame(
+        X_train_transformed, columns=feature_names,
+    )
+
+    background = shap.utils.sample(
+        X_train_transformed_df, BACKGROUND_SIZE, random_state=RANDOM_STATE,
+    )
+
+    joblib.dump(background, BACKGROUND_PATH)
+    joblib.dump(feature_names, FEATURE_NAMES_PATH)
+
+    expected_value = (
+        classifier.intercept_[0]
+        + np.dot(classifier.coef_[0], background.values.mean(axis=0))
+    )
+    print(
+        f"SHAP background saved ({len(background)} rows, "
+        f"{len(feature_names)} features); "
+        f"expected_value (logit) = {expected_value:.6f}"
+    )
+
+
 def print_result_row(model_type: str, metrics: dict[str, float]) -> None:
     """Print one results table row in the ``Accuracy | F1 | AUC`` format."""
     print(
@@ -118,6 +162,11 @@ def main() -> None:
     save_artifacts(best_pipeline, list(X.columns))
     print(f"Saved pipeline to {MODEL_PATH}")
     print(f"Saved input columns to {COLUMNS_PATH}")
+
+    if best_name == 'logistic_regression':
+        save_shap_background(best_pipeline, X_train)
+        print(f"Saved SHAP background to {BACKGROUND_PATH}")
+        print(f"Saved feature names to {FEATURE_NAMES_PATH}")
 
 
 if __name__ == '__main__':
