@@ -720,3 +720,4 @@ MIT Lisansı altında yayımlanmıştır. Detaylar için [`LICENSE`](LICENSE) do
 Geliştirenler: [@muratcan-ates](https://github.com/muratcan-ates) · Yusuf Eker · Berkan Öksüz
 
 </div>
+
