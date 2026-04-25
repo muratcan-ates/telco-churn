@@ -193,6 +193,8 @@ API tüm endpoint'lerde manuel olarak doğrulanmış, 15 senaryoluk bir test set
 
 Senaryo bazlı istek/yanıt dökümleri ve latency ölçümleri için: [`reports/api_test_report.md`](reports/api_test_report.md).
 
+Not: API validation bölümü, modelin doğruluğunu değil servis davranışını doğrulamak için hazırlanmıştır. Bu kapsamda başarılı tahmin isteği, sınır değerler, eksik/geçersiz alanlar, response formatı, latency ve `x-request-id` header kontrolü ayrı senaryolarla incelenmiştir.
+
 <br/>
 
 ---
